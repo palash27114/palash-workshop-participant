@@ -29,7 +29,7 @@ from bronze import ingest_events, ingest_postgres
 from config import load_settings
 from gold import build_gold
 from lineage import RunContext
-from seed_sources import load_postgres_from_landing
+from seed_sources import load_postgres_from_landing, source_tables_exist
 from silver import build_silver
 from storage import Lake
 
@@ -75,9 +75,17 @@ def main(argv: list[str] | None = None) -> int:
     log.info("run run_id=%s status=started layers=%s settings=%s", ctx.run_id, args.layers, settings.redacted())
 
     try:
-        if os.getenv("SEED_SOURCE_DB", "false").lower() == "true":
-            with ctx.step("setup", "seed_source_postgres"):
-                load_postgres_from_landing(settings, lake)
+        # Cloud bootstrap: Aurora is private to the VPC, so the job seeds the HR source from the CSVs in
+        # S3 landing. "true" seeds only when the tables are missing; "force" always reloads them.
+        seed = os.getenv("SEED_SOURCE_DB", "false").lower()
+        if seed in ("true", "force"):
+            with ctx.step("setup", "seed_source_postgres") as rec:
+                if seed == "force" or not source_tables_exist(settings):
+                    load_postgres_from_landing(settings, lake)
+                    rec.details["seeded"] = True
+                else:
+                    rec.details["seeded"] = False
+                    log.info("source tables already present in schema %s - seeding skipped", settings.source_schema)
         if "bronze" in args.layers:
             ingest_postgres(settings, lake, ctx, force=args.force_bronze)
             ingest_events(settings, lake, ctx, force=args.force_bronze)

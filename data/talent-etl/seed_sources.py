@@ -82,6 +82,16 @@ def load_postgres(settings: Settings, files: dict[str, bytes]) -> None:
             log.info("seed loaded %s.%s rows=%d", settings.source_schema, table, cur.rowcount)
 
 
+def source_tables_exist(settings: Settings) -> bool:
+    """True if every HR source table already exists in ``settings.source_schema``."""
+    with connect(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = %s AND table_name = ANY(%s)",
+            (settings.source_schema, list(settings.source_tables)),
+        )
+        return cur.fetchone()[0] == len(settings.source_tables)
+
+
 def load_postgres_from_landing(settings: Settings, lake: Lake) -> None:
     """Cloud path: seed PostgreSQL from the CSVs previously uploaded to S3."""
     names = ["schema.sql"] + [f"{t}.csv" for t in settings.source_tables]
