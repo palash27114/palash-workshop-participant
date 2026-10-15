@@ -52,8 +52,32 @@ ATTRITION_POINTS = {
 ATTRITION_TIERS = ((5, "High"), (3, "Medium"), (0, "Low"))  # score >= threshold -> tier
 
 
+RULES = {
+    "high_performer": f"latest rating >= {HIGH_PERFORMER_MIN_RATING}",
+    "low_performer": f"latest rating <= {LOW_PERFORMER_MAX_RATING}",
+    "critical_skill_gap": (f"latest assessment short of required level by >= {CRITICAL_GAP_MIN}, or short by any "
+                           f"amount where the role requires level >= {KEY_COMPETENCY_MIN_REQUIRED}"),
+    "high_potential": f"talent review potential = High and latest rating >= {HIGH_PERFORMER_MIN_RATING}",
+    "promotion_tiers": {
+        "1 - Ready now": "high potential, readiness 'Ready Now', no critical skill gaps",
+        "2 - Ready now, close skill gaps": "high potential, readiness 'Ready Now', >= 1 critical gap",
+        "3 - Emerging (1-2 years)": "high potential, readiness '1-2 Years'",
+        "4 - Not in pipeline": "everyone else",
+    },
+    "learning_active": f"any learning event in the last {INACTIVE_LEARNING_DAYS} days before the analysis date",
+    "quiz_pass_rate": "quiz_passed / (quiz_passed + quiz_attempted); quiz_attempted is a failed attempt",
+    "attrition_points": ATTRITION_POINTS,
+    "attrition_tiers": {tier: f"score >= {t}" for t, tier in ATTRITION_TIERS},
+    "negative_comment_pattern": NEGATIVE_COMMENT_PATTERN,
+}
+
+
 class GrainError(Exception):
     """Raised when a Gold table violates its declared grain (duplicate keys)."""
+
+
+class GoldCheckError(Exception):
+    """Raised when a Gold table does not reconcile with Silver or breaks a business-rule invariant."""
 
 
 # ----------------------------------------------------------------- helpers
@@ -345,26 +369,163 @@ def check_grain(df: pd.DataFrame, table: GoldTable) -> None:
         raise GrainError(f"{table.name}: {dupes} duplicate rows at grain {table.grain}")
 
 
+# ----------------------------------------------------------------- reconciliation & invariants
+_LEVELS = [f"level_{i}" for i in range(1, 6)]
+_TRAINING_COUNTS = {
+    "enrollments": "enrollment", "modules_completed": "module_completed", "courses_completed": "course_completed",
+    "quizzes_failed": "quiz_attempted", "quizzes_passed": "quiz_passed", "certifications_earned": "certification_earned",
+}
+
+
+def reconcile(name: str, df: pd.DataFrame, silver: dict[str, pd.DataFrame]) -> dict[str, dict]:
+    """
+    Cross-check a Gold table against Silver and its own business rules.
+
+    Every entry is ``{"expected", "actual", "ok"}``. Three kinds of check:
+    cardinality (row counts vs the Silver population), conservation (sums in
+    Gold equal counts in Silver, so nothing was dropped or double counted) and
+    invariants (every row obeys the rule that produced it).
+    """
+    checks: dict[str, dict] = {}
+
+    def eq(label: str, expected, actual) -> None:
+        expected, actual = int(expected), int(actual)
+        checks[label] = {"expected": expected, "actual": actual, "ok": expected == actual}
+
+    n_emp = len(silver["employees"])
+    if name == "review_history":
+        eq("rows_equal_silver_reviews", len(silver["performance_reviews"]), len(df))
+    elif name == "employee_performance_summary":
+        eq("one_row_per_employee", n_emp, len(df))
+        means = silver["performance_reviews"].groupby("employee_id")["rating"].mean().round(2)
+        joined = df.set_index("employee_id")["avg_rating"].astype(float)
+        eq("avg_rating_mismatches", 0, (joined.sub(means.astype(float), fill_value=0).abs() > 1e-9).sum())
+    elif name == "skill_gaps":
+        latest = _latest_assessments(silver)
+        eq("rows_equal_assessments_below_required", (latest["gap"] > 0).sum(), len(df))
+        eq("critical_gaps_equal_rule", latest["is_critical_gap"].sum(), df["is_critical_gap"].sum())
+    elif name == "promotion_pipeline":
+        eq("rows_equal_talent_reviews", len(silver["talent_review"]), len(df))
+        tier1 = df[df["promotion_tier"] == "1 - Ready now"]
+        violations = (~tier1["is_high_potential"] | (tier1["promotion_readiness"] != "Ready Now")
+                      | (tier1["critical_gap_count"] > 0)).sum()
+        eq("ready_now_rule_violations", 0, violations)
+    elif name == "training_summary":
+        eq("one_row_per_employee", n_emp, len(df))
+        events = silver["learning_activity"]["event_type"].value_counts()
+        for col, event_type in _TRAINING_COUNTS.items():
+            eq(f"{col}_sum_equals_silver_events", events.get(event_type, 0), df[col].sum())
+    elif name == "attrition_risk":
+        eq("one_row_per_employee", n_emp, len(df))
+        rescored = df["risk_drivers"].fillna("").map(
+            lambda s: sum(ATTRITION_POINTS[d] for d in s.split(", ") if d))
+        eq("risk_score_equals_sum_of_driver_points", 0, (rescored != df["risk_score"]).sum())
+    elif name == "team_performance_outcomes":
+        eq("one_row_per_team", len(silver["teams"]), len(df))
+        eq("headcount_sums_to_employees", n_emp, df["headcount"].sum())
+        eq("project_counts_sum_to_silver_projects", len(silver["projects"]), df["projects_count"].sum())
+    elif name == "skill_distribution":
+        org = df[df["department"] == "All"]
+        eq("org_levels_sum_to_latest_assessments", len(_latest_assessments(silver)), org[_LEVELS].to_numpy().sum())
+        eq("department_rows_sum_to_org_rows", org[_LEVELS].to_numpy().sum(),
+           df[df["department"] != "All"][_LEVELS].to_numpy().sum())
+    return checks
+
+
+# ----------------------------------------------------------------- headline answers
+def headline_summary(tables: dict[str, pd.DataFrame]) -> dict[str, object]:
+    """One short, factual answer per business question, for the notebook and the demo."""
+    perf = tables["employee_performance_summary"]
+    gaps = tables["skill_gaps"]
+    promo = tables["promotion_pipeline"]
+    train = tables["training_summary"]
+    risk = tables["attrition_risk"]
+    teams = tables["team_performance_outcomes"]
+    skills = tables["skill_distribution"]
+    with_projects = teams[teams["has_projects"]]
+    crit = gaps[gaps["is_critical_gap"]]
+    org_skills = skills[skills["department"] == "All"]
+    manager_high = risk[risk["manager_attrition_risk"] == "High"]
+
+    def corr(a: str, b: str) -> float | None:
+        pair = with_projects[[a, b]].astype(float).dropna()
+        if len(pair) < 3 or pair.nunique().min() < 2:
+            return None  # a correlation needs at least 3 points with some variation
+        value = pair[a].corr(pair[b])
+        return None if pd.isna(value) else round(float(value), 3)
+
+    return {
+        "Q1_performance": {
+            "employees_reviewed": int(perf["reviews_count"].notna().sum()),
+            "avg_latest_rating": round(float(perf["latest_rating"].mean()), 2),
+            "rating_trend": perf["rating_trend"].value_counts().to_dict(),
+            "performance_band": perf["performance_band"].value_counts().to_dict(),
+        },
+        "Q2_skill_gaps": {
+            "critical_gaps": int(len(crit)),
+            "employees_with_critical_gap": int(crit["employee_id"].nunique()),
+            "top_competencies_by_critical_gaps": crit["competency"].value_counts().head(5).to_dict(),
+        },
+        "Q3_promotion": {
+            "tiers": promo["promotion_tier"].value_counts().sort_index().to_dict(),
+            "high_potential_at_high_attrition_risk": int(promo["retention_flag"].sum()),
+        },
+        "Q4_training": {
+            "avg_courses_completed": round(float(train["courses_completed"].mean()), 2),
+            "certifications_earned": int(train["certifications_earned"].sum()),
+            "employees_with_no_learning_activity": int((train["enrollments"] == 0).sum()),
+            "employees_learning_active": int(train["learning_active"].sum()),
+        },
+        "Q5_attrition": {
+            "computed_tiers": risk["computed_risk_tier"].value_counts().to_dict(),
+            "manager_high_also_computed_high": int((manager_high["computed_risk_tier"] == "High").sum()),
+            "manager_high_total": int(len(manager_high)),
+        },
+        "Q6_team_outcomes": {
+            "teams_with_projects": int(len(with_projects)),
+            "corr_avg_rating_vs_outcome_score": corr("avg_latest_rating", "avg_outcome_score"),
+            "corr_pct_high_performers_vs_on_time": corr("pct_high_performers", "pct_projects_on_time"),
+            "corr_critical_gaps_vs_outcome_score": corr("critical_gaps_per_head", "avg_outcome_score"),
+            "note": "team-level; only teams with projects; small sample, indicative only",
+        },
+        "Q7_skill_distribution": {
+            "competencies": int(org_skills["competency_id"].nunique()),
+            "lowest_pct_meeting_required": org_skills.nsmallest(5, "pct_meeting_required")
+                .set_index("competency")["pct_meeting_required"].to_dict(),
+            "avg_proficiency_by_category": org_skills.groupby("competency_category")["avg_proficiency"]
+                .mean().round(2).to_dict(),
+        },
+    }
+
+
 def build_gold(settings: Settings, lake: Lake, ctx: RunContext) -> None:
-    """Read Silver once, build every Gold table, validate grain and publish."""
+    """Read Silver once, build every Gold table, check grain + reconciliation, publish, summarise."""
     silver = {name: lake.read_parquet(f"{settings.silver_prefix}{name}/") for name in SILVER_INPUTS}
     silver_rows = sum(len(df) for df in silver.values())
-    n_employees = len(silver["employees"])
-    catalog = {}
+    catalog, tables = {}, {}
 
     for table in GOLD_TABLES:
         with ctx.step("gold", table.name) as rec:
             df = table.build(silver, settings.run_date)
             check_grain(df, table)
-            if table.employee_grain and len(df) != n_employees:
-                raise GrainError(f"{table.name}: {len(df)} rows but {n_employees} employees in Silver")
+            checks = reconcile(table.name, df, silver)
+            rec.details.update(grain=list(table.grain), question=table.question, checks=checks)
+            failed = {k: v for k, v in checks.items() if not v["ok"]}
+            if failed:
+                raise GoldCheckError(f"{table.name}: {failed}")
+            tables[table.name] = df
             df = df.assign(_gold_run_id=ctx.run_id, _as_of=settings.run_date.isoformat())
             rec.outputs = lake.replace_dataset(f"{settings.gold_prefix}{table.name}/", df)
             rec.inputs = [lake.uri(f"{settings.silver_prefix}{n}/") for n in SILVER_INPUTS]
             rec.rows_read = silver_rows
             rec.rows_written = len(df)
-            rec.details.update(grain=list(table.grain), question=table.question)
-            catalog[table.name] = {"grain": list(table.grain), "question": table.question,
-                                   "rows": len(df), "columns": [c for c in df.columns]}
+            catalog[table.name] = {"grain": list(table.grain), "question": table.question, "rows": len(df),
+                                   "checks_passed": sorted(checks), "columns": list(df.columns)}
 
-    lake.put_json(f"{settings.gold_prefix}_catalog.json", {"run_id": ctx.run_id, "tables": catalog})
+    with ctx.step("gold", "_summary") as rec:
+        summary = headline_summary(tables)
+        lake.put_json(f"{settings.gold_prefix}_summary.json",
+                      {"run_id": ctx.run_id, "as_of": settings.run_date.isoformat(), "answers": summary})
+        rec.outputs = [lake.uri(f"{settings.gold_prefix}_summary.json")]
+    lake.put_json(f"{settings.gold_prefix}_catalog.json",
+                  {"run_id": ctx.run_id, "as_of": settings.run_date.isoformat(), "rules": RULES, "tables": catalog})

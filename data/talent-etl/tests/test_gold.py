@@ -75,3 +75,36 @@ def test_grain_violation_raises():
     table = gold.GOLD_TABLES[1]
     with pytest.raises(gold.GrainError):
         gold.check_grain(pd.DataFrame({"employee_id": [1, 1]}), table)
+
+
+def _built(silver):
+    return {t.name: t.build(silver, RUN) for t in gold.GOLD_TABLES}
+
+
+def test_every_gold_table_reconciles_with_silver(silver):
+    for name, df in _built(silver).items():
+        checks = gold.reconcile(name, df, silver)
+        assert checks, f"{name} has no reconciliation checks"
+        assert all(c["ok"] for c in checks.values()), (name, checks)
+
+
+@pytest.mark.parametrize("name,tamper,check", [
+    ("review_history", lambda d: d.iloc[1:], "rows_equal_silver_reviews"),
+    ("training_summary", lambda d: d.assign(courses_completed=d["courses_completed"] + 1),
+     "courses_completed_sum_equals_silver_events"),
+    ("attrition_risk", lambda d: d.assign(risk_score=d["risk_score"] + 1), "risk_score_equals_sum_of_driver_points"),
+    ("team_performance_outcomes", lambda d: d.assign(headcount=d["headcount"] * 2), "headcount_sums_to_employees"),
+    ("promotion_pipeline", lambda d: d.assign(promotion_tier="1 - Ready now"), "ready_now_rule_violations"),
+    ("skill_distribution", lambda d: d.assign(level_1=d["level_1"] + 1), "department_rows_sum_to_org_rows"),
+])
+def test_reconcile_catches_dropped_or_wrong_numbers(silver, name, tamper, check):
+    df = tamper(_built(silver)[name])
+    assert not gold.reconcile(name, df, silver)[check]["ok"]
+
+
+def test_headline_summary_answers_every_question(silver):
+    summary = gold.headline_summary(_built(silver))
+    assert [k.split("_")[0] for k in summary] == ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"]
+    assert summary["Q2_skill_gaps"]["employees_with_critical_gap"] == 1
+    assert summary["Q3_promotion"]["tiers"]["1 - Ready now"] == 1
+    assert summary["Q5_attrition"]["manager_high_also_computed_high"] == 1
