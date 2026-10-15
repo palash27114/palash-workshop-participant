@@ -3,8 +3,8 @@
 # Purpose: Host the dashboard in AWS without editing infra/ or bin/.
 # Usage:   data/talent-etl/deploy/dashboard_deploy.sh            private: node loopback only, opened through a
 #                                                                kubectl tunnel at http://localhost:8502
-#          data/talent-etl/deploy/dashboard_deploy.sh --public   public: AWS load balancer URL, password-protected
-#                                                                (HTTP only: the workshop account cannot issue certificates)
+#          data/talent-etl/deploy/dashboard_deploy.sh --public   public: AWS load balancer URL, open to anyone
+#                                                                (demo; set DASHBOARD_PASSWORD to add a password screen)
 # Image note: the cloud image ships numexpr/bottleneck built for numpy 1.x; they are upgraded at start.
 # Prereq:  cloud_setup.sh + cloud_run.sh have run (bucket, node S3 access, Gold data in S3).
 
@@ -28,13 +28,13 @@ BIND="127.0.0.1"
 AUTH_ENV=""
 if [ "$PUBLIC" = true ]; then
     BIND="0.0.0.0"
-    # One random password per deployment, kept in a Secret and reused on redeploy.
-    if ! kubectl get secret "${NAME}-auth" > /dev/null 2>&1; then
-        openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16 \
-            | kubectl create secret generic "${NAME}-auth" --from-file=DASHBOARD_PASSWORD=/dev/stdin > /dev/null
-    fi
-    AUTH_ENV="          envFrom:
+    # Open demo by default. Set DASHBOARD_PASSWORD before running to add the app's password screen.
+    if [ -n "${DASHBOARD_PASSWORD:-}" ]; then
+        printf '%s' "$DASHBOARD_PASSWORD" | kubectl create secret generic "${NAME}-auth" \
+            --from-file=DASHBOARD_PASSWORD=/dev/stdin --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+        AUTH_ENV="          envFrom:
             - secretRef: {name: ${NAME}-auth}"
+    fi
 fi
 
 echo "== Shipping dashboard + pipeline modules"
@@ -140,7 +140,6 @@ SVC
     curl -sf -m 5 "http://${HOST}/_stcore/health" > /dev/null || { echo "Not answering yet: http://${HOST}"; exit 1; }
     echo ""
     echo "Public URL: http://${HOST}"
-    echo "Password:   kubectl get secret ${NAME}-auth -o jsonpath='{.data.DASHBOARD_PASSWORD}' | base64 -d; echo"
     exit 0
 fi
 
