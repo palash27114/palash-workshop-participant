@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Script: Run the Streamlit dashboard on the workshop EKS cluster, reading Gold from the S3 data lake
-# Purpose: Host the dashboard in AWS without editing infra/ or bin/. It listens on the node's loopback
-#          only (never on a public address) and is reached through a kubectl tunnel.
-# Usage:   data/talent-etl/deploy/dashboard_deploy.sh      then open http://localhost:8502
+# Purpose: Host the dashboard in AWS without editing infra/ or bin/.
+# Usage:   data/talent-etl/deploy/dashboard_deploy.sh            private: node loopback only, opened through a
+#                                                                kubectl tunnel at http://localhost:8502
+#          data/talent-etl/deploy/dashboard_deploy.sh --public   public: AWS load balancer URL, password-protected
+#                                                                (HTTP only: the workshop account cannot issue certificates)
 # Image note: the cloud image ships numexpr/bottleneck built for numpy 1.x; they are upgraded at start.
 # Prereq:  cloud_setup.sh + cloud_run.sh have run (bucket, node S3 access, Gold data in S3).
 
@@ -20,6 +22,20 @@ aws eks update-kubeconfig --region "$AWS_REGION" --name "coding-workshop-${PARTI
 
 NAME="talent-dashboard"
 LOCAL_PORT="${LOCAL_PORT:-8502}"
+PUBLIC=false
+[ "${1:-}" = "--public" ] && PUBLIC=true
+BIND="127.0.0.1"
+AUTH_ENV=""
+if [ "$PUBLIC" = true ]; then
+    BIND="0.0.0.0"
+    # One random password per deployment, kept in a Secret and reused on redeploy.
+    if ! kubectl get secret "${NAME}-auth" > /dev/null 2>&1; then
+        openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16 \
+            | kubectl create secret generic "${NAME}-auth" --from-file=DASHBOARD_PASSWORD=/dev/stdin > /dev/null
+    fi
+    AUTH_ENV="          envFrom:
+            - secretRef: {name: ${NAME}-auth}"
+fi
 
 echo "== Shipping dashboard + pipeline modules"
 kubectl create configmap "${NAME}-lib" --from-file="$JOB_DIR/config.py" --from-file="$JOB_DIR/storage.py" \
@@ -46,8 +62,8 @@ spec:
         # Changing this forces a restart so new code is picked up.
         talent-etl/deployed-at: "$(date -u +%Y%m%dT%H%M%SZ)"
     spec:
-      # Node network: uses the node role's data-lake permission (IMDS hop limit 1). The app binds to the
-      # node's 127.0.0.1 only, so it is reachable through kubectl port-forward and nothing else.
+      # Node network: uses the node role's data-lake permission (IMDS hop limit 1). Private mode binds to
+      # the node's 127.0.0.1 (kubectl port-forward only); public mode binds 0.0.0.0 behind the load balancer.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -60,7 +76,7 @@ spec:
               set -e
               pip install --no-cache-dir --quiet -r /src/lib/requirements.txt streamlit==1.66.0 altair==6.3.0 "numexpr>=2.10" "bottleneck>=1.4"
               mkdir -p /tmp/app/dashboard && cp /src/lib/*.py /tmp/app/ && cp /src/dashboard/*.py /tmp/app/dashboard/
-              cd /tmp/app && exec streamlit run dashboard/app.py --server.address 127.0.0.1 \
+              cd /tmp/app && exec streamlit run dashboard/app.py --server.address ${BIND} \
                 --server.port 8501 --server.headless true --browser.gatherUsageStats false \
                 --theme.primaryColor "#2a78d6"
           env:
@@ -70,6 +86,7 @@ spec:
             - {name: AWS_REGION, value: "${AWS_REGION}"}
             - {name: AWS_DEFAULT_REGION, value: "${AWS_REGION}"}
             - {name: LAKE_BUCKET, value: "coding-workshop-datalake-${PARTICIPANT_ID}"}
+${AUTH_ENV}
           readinessProbe:
             exec: {command: ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]}
             initialDelaySeconds: 20
@@ -90,6 +107,45 @@ EOF
 echo "== Waiting until the dashboard is ready (pip install takes a minute or two)"
 kubectl rollout status "deploy/${NAME}" --timeout=600s
 
+if [ "$PUBLIC" = true ]; then
+    echo "== Public load balancer"
+    SUBNETS="$(aws eks describe-cluster --name "coding-workshop-${PARTICIPANT_ID}" \
+        --query 'cluster.resourcesVpcConfig.subnetIds' --output text | tr '\t' ',')"
+    kubectl apply -f - << SVC > /dev/null
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${NAME}
+  labels: {app.kubernetes.io/name: ${NAME}, app.kubernetes.io/part-of: coding-workshop}
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-subnets: "${SUBNETS}"
+spec:
+  type: LoadBalancer
+  selector: {app.kubernetes.io/name: ${NAME}}
+  ports:
+    - {name: http, port: 80, targetPort: 8501, protocol: TCP}
+SVC
+    HOST=""
+    for _ in $(seq 1 60); do
+        HOST="$(kubectl get svc "$NAME" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+        [ -n "$HOST" ] && break
+        sleep 5
+    done
+    [ -n "$HOST" ] || { echo "ERROR: no load balancer address yet"; kubectl describe svc "$NAME" | tail -8; exit 1; }
+    echo "  waiting for http://${HOST} to answer (DNS + health checks take a few minutes)"
+    for _ in $(seq 1 60); do
+        curl -sf -m 5 "http://${HOST}/_stcore/health" > /dev/null && break
+        sleep 10
+    done
+    curl -sf -m 5 "http://${HOST}/_stcore/health" > /dev/null || { echo "Not answering yet: http://${HOST}"; exit 1; }
+    echo ""
+    echo "Public URL: http://${HOST}"
+    echo "Password:   kubectl get secret ${NAME}-auth -o jsonpath='{.data.DASHBOARD_PASSWORD}' | base64 -d; echo"
+    exit 0
+fi
+
+# Private mode: make sure no public load balancer is left over from an earlier --public deploy.
+kubectl delete svc "$NAME" --ignore-not-found > /dev/null
 echo "== Opening tunnel http://localhost:${LOCAL_PORT} -> dashboard in EKS"
 pkill -f "port-forward deploy/${NAME}" 2> /dev/null || true
 nohup kubectl port-forward "deploy/${NAME}" "${LOCAL_PORT}:8501" > /tmp/talent-dashboard-tunnel.log 2>&1 &

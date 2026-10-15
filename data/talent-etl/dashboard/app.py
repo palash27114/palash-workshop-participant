@@ -13,6 +13,9 @@ sidebar to filter by department and job level; every tab follows the filter.
 
 from __future__ import annotations
 
+import hmac
+import os
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -36,6 +39,25 @@ TIER_COLORS = ["#0d366b", "#256abf", "#5598e7", "#9ec5f4"]
 SEQ = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
 
 st.set_page_config(page_title="ACME Talent Lake", page_icon=":material/insights:", layout="wide")
+
+
+def require_password() -> None:
+    """When DASHBOARD_PASSWORD is set (public deployment), ask for it before showing any data."""
+    expected = os.getenv("DASHBOARD_PASSWORD", "")
+    if not expected or st.session_state.get("authenticated"):
+        return
+    st.title("ACME Talent Lake")
+    st.caption("This dashboard contains employee data. Enter the password to continue.")
+    entered = st.text_input("Password", type="password", key="dashboard_password")
+    if entered:
+        if hmac.compare_digest(entered.encode(), expected.encode()):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        st.error("Wrong password. Check it and try again.")
+    st.stop()
+
+
+require_password()
 
 
 @st.cache_data(ttl=600, show_spinner="Reading the Gold layer…")

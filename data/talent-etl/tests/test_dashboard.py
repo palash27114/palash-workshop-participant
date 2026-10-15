@@ -52,3 +52,21 @@ def test_app_renders_every_tab_without_errors():
     at.multiselect(key="f_departments").select("Sales").run()
     assert not at.exception, at.exception
     assert at.metric[0].value != "2,000"
+
+
+def test_password_gate_hides_data_until_correct_password(monkeypatch):
+    """Public deployments set DASHBOARD_PASSWORD; nothing but the password box renders before it is entered."""
+    from streamlit.testing.v1 import AppTest
+    try:
+        gold_data.load_gold()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"Gold layer not available: {exc}")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret-test")
+    at = AppTest.from_file(str(DASHBOARD / "app.py"), default_timeout=60).run()
+    assert not at.exception
+    assert len(at.tabs) == 0 and len(at.metric) == 0
+    at.text_input(key="dashboard_password").input("wrong").run()
+    assert at.error and len(at.tabs) == 0
+    at.text_input(key="dashboard_password").input("s3cret-test").run()
+    assert not at.exception
+    assert len(at.tabs) == 7
