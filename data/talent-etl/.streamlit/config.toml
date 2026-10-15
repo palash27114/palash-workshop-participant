@@ -1,0 +1,11 @@
+[theme]
+primaryColor = "#2a78d6"
+
+[server]
+headless = true
+# Local only: the dashboard shows personal HR data, never expose it on the network.
+address = "localhost"
+port = 8501
+
+[browser]
+gatherUsageStats = false
