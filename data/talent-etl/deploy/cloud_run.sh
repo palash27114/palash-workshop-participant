@@ -76,7 +76,7 @@ spec:
           args:
             - |
               set -e
-              pip install --no-cache-dir --quiet -r /app/requirements.txt
+              pip install --no-cache-dir --quiet -r /app/requirements.txt "numexpr>=2.10" "bottleneck>=1.4"
               cd /app && python job.py ${JOB_ARGS}
           env:
             - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
