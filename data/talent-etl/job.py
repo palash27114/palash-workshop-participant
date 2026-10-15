@@ -11,6 +11,7 @@ Usage::
 
     python job.py                         # all layers
     python job.py --layers silver,gold    # rebuild from existing Bronze
+    python job.py --force-bronze          # reload today's Bronze (it is write-once otherwise)
     RUN_DATE=2026-10-15 python job.py     # pin the snapshot date (idempotent re-runs)
 
 Environment variables are documented in config.py and README.md. Exit code is
@@ -51,6 +52,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ACME talent medallion ETL")
     parser.add_argument("--layers", default=",".join(LAYERS),
                         help="comma-separated subset of bronze,silver,gold (default: all)")
+    parser.add_argument("--force-bronze", action="store_true",
+                        help="reload today's Bronze even if already loaded (Bronze is write-once otherwise)")
     args = parser.parse_args(argv)
     args.layers = [layer.strip() for layer in args.layers.split(",") if layer.strip()]
     unknown = set(args.layers) - set(LAYERS)
@@ -76,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
             with ctx.step("setup", "seed_source_postgres"):
                 load_postgres_from_landing(settings, lake)
         if "bronze" in args.layers:
-            ingest_postgres(settings, lake, ctx)
-            ingest_events(settings, lake, ctx)
+            ingest_postgres(settings, lake, ctx, force=args.force_bronze)
+            ingest_events(settings, lake, ctx, force=args.force_bronze)
         if "silver" in args.layers:
             build_silver(settings, lake, ctx)
         if "gold" in args.layers:

@@ -1,13 +1,14 @@
 """
-End-to-end test against real local services (LocalStack S3 + PostgreSQL).
+End-to-end tests against real local services (LocalStack S3 + PostgreSQL).
 
-Uses a throwaway lake bucket so it never touches your working lake. Skipped
-automatically when LocalStack or PostgreSQL is not reachable, or when the
-source tables have not been seeded (run ``python seed_sources.py`` first).
+Each test uses a throwaway lake bucket so it never touches your working lake.
+Skipped automatically when LocalStack or PostgreSQL is not reachable, or when
+the source tables have not been seeded (run ``python seed_sources.py`` first).
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -17,6 +18,7 @@ from config import load_settings
 from storage import Lake
 
 pytestmark = pytest.mark.integration
+EVENTS_STEP = ("bronze", "lms/learning_activity")
 
 
 @pytest.fixture
@@ -50,11 +52,19 @@ def _steps(lake):
     return {(s["layer"], s["dataset"]): s for s in lake.get_json("_lineage/latest.json")["steps"]}
 
 
+def _bronze_objects(lake):
+    return {o["Key"]: o["ETag"] for o in lake.list_objects("bronze/")}
+
+
 def test_pipeline_end_to_end_reconciles_and_is_idempotent(scratch_lake):
     assert job.main([]) == 0
     first = _steps(scratch_lake)
-    manifest = scratch_lake.get_json("_lineage/latest.json")
-    assert manifest["status"] == "succeeded"
+    assert scratch_lake.get_json("_lineage/latest.json")["status"] == "succeeded"
+
+    # Bronze reconciled to source: every landing line landed, every HR table check passed.
+    assert first[EVENTS_STEP]["rows_read"] == first[EVENTS_STEP]["rows_written"] == 29868
+    for table in ("employees", "performance_reviews", "talent_review"):
+        assert all(first[("bronze", f"postgres/{table}")]["details"]["checks"].values())
 
     # Bronze -> Silver: nothing lost.
     events = first[("silver", "learning_activity")]
@@ -65,14 +75,62 @@ def test_pipeline_end_to_end_reconciles_and_is_idempotent(scratch_lake):
     employees = first[("silver", "employees")]["rows_written"]
     assert first[("gold", "employee_performance_summary")]["rows_written"] == employees
 
-    # Second run, same RUN_DATE: identical outputs, no new bronze files.
-    keys_before = scratch_lake.list_keys("")
+    # Second run, same RUN_DATE: Bronze is untouched (write-once), Silver/Gold identical.
+    bronze_before = _bronze_objects(scratch_lake)
     assert job.main([]) == 0
     second = _steps(scratch_lake)
-    assert second[("bronze", "lms/learning_activity")]["details"]["new_or_changed_files"] == 0
+    assert _bronze_objects(scratch_lake) == bronze_before
+    assert second[EVENTS_STEP]["details"]["loaded_files"] == 0
+    assert "skipped" in second[("bronze", "postgres/employees")]["details"]
     for k in first:
-        if k == ("bronze", "lms/learning_activity"):
-            continue  # incremental: unchanged files are skipped, so it legitimately writes 0 rows
-        assert first[k]["rows_written"] == second[k]["rows_written"], k
-    data_keys = lambda keys: {k for k in keys if not k.startswith("_lineage/")}  # noqa: E731
-    assert data_keys(scratch_lake.list_keys("")) == data_keys(keys_before)
+        if k[0] in ("silver", "gold"):
+            assert first[k]["rows_written"] == second[k]["rows_written"], k
+
+
+def test_bronze_manifests_record_source_bytes_and_counts(scratch_lake):
+    assert job.main(["--layers", "bronze"]) == 0
+    pg = scratch_lake.get_json("bronze/postgres/employees/ingest_date=2026-10-15/_manifest.json")
+    assert pg["source_row_count"] == pg["parquet"]["rows"] == 2000
+    raw = scratch_lake.head("bronze/postgres/employees/ingest_date=2026-10-15/employees.csv")
+    assert raw["ContentLength"] == pg["raw_export"]["bytes"]
+
+    ev = scratch_lake.get_json("bronze/lms/learning_activity/ingest_date=2026-10-15/_manifest.json")
+    assert ev["totals"]["files"] == 783
+    assert ev["totals"]["source_lines"] == ev["totals"]["bronze_rows"] == 29868
+    entry = next(iter(ev["files"].values()))
+    copy_key = entry["raw_copy"].split("/", 3)[3]
+    assert scratch_lake.head(copy_key)["ContentLength"] == entry["source_bytes"]
+
+
+def test_changed_landing_file_is_versioned_not_overwritten(scratch_lake):
+    assert job.main([]) == 0
+    silver_rows = _steps(scratch_lake)[("silver", "learning_activity")]["rows_written"]
+    bronze_before = _bronze_objects(scratch_lake)
+
+    # Upstream re-delivers one file with an extra valid event.
+    key = scratch_lake.list_keys("landing/learning_activity/", ".jsonl")[0]
+    extra = {"event_id": "EV-TEST-NEW", "employee_id": "1", "event_date": "2026-01-01T09:00:00",
+             "event_type": "enrollment", "course_name": "Python Basics", "text": "late delivery", "score": None}
+    scratch_lake.put_bytes(key, scratch_lake.get_bytes(key) + (json.dumps(extra) + "\n").encode())
+
+    assert job.main([]) == 0
+    steps = _steps(scratch_lake)
+    assert steps[EVENTS_STEP]["details"]["changed_files"] == 1
+    bronze_after = _bronze_objects(scratch_lake)
+    # Old objects are still there, byte-for-byte (same ETag): nothing was overwritten.
+    assert all(bronze_after.get(k) == etag for k, etag in bronze_before.items() if "_manifest" not in k)
+    assert len(bronze_after) == len(bronze_before) + 2  # new .jsonl copy + new .parquet
+    # Silver reads only the latest load of the changed file: exactly one new row, no duplicates.
+    silver = steps[("silver", "learning_activity")]
+    assert silver["rows_written"] == silver_rows + 1
+    assert silver["details"]["superseded_bronze_rows"] > 0
+
+
+def test_force_bronze_reloads_without_duplicating(scratch_lake):
+    assert job.main([]) == 0
+    silver_rows = _steps(scratch_lake)[("silver", "learning_activity")]["rows_written"]
+    assert job.main(["--force-bronze"]) == 0
+    steps = _steps(scratch_lake)
+    assert steps[EVENTS_STEP]["details"]["loaded_files"] == 783
+    assert "skipped" not in steps[("bronze", "postgres/employees")]["details"]
+    assert steps[("silver", "learning_activity")]["rows_written"] == silver_rows

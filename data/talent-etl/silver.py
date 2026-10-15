@@ -79,6 +79,23 @@ def parse_event_lines(bronze: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     return parsed, malformed
 
 
+def latest_file_loads(bronze: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Keep only the most recent Bronze load of each landing file.
+
+    Bronze is write-once, so a file that changed upstream (or was re-loaded
+    with ``--force-bronze``) has several loads side by side. Each load has one
+    ``_ingested_at`` per file; Silver must read exactly one load per file.
+
+    Returns:
+        (rows of the latest load per file, number of superseded rows excluded)
+    """
+    loads = bronze[["_source_key", "_ingested_at"]].drop_duplicates()
+    latest = loads.sort_values("_ingested_at").drop_duplicates("_source_key", keep="last")
+    current = bronze.merge(latest, on=["_source_key", "_ingested_at"], how="inner")
+    return current, len(bronze) - len(current)
+
+
 def conform_employees(df: pd.DataFrame) -> pd.DataFrame:
     """Add derived attributes used downstream."""
     out = df.copy()
@@ -118,12 +135,12 @@ CONFORMERS = {
 
 # --------------------------------------------------------------------------- IO orchestration
 def _latest_bronze_partition(lake: Lake, settings: Settings, table: str) -> str:
-    """Most recent ``ingest_date=`` partition on or before the run date."""
+    """Most recent *committed* ``ingest_date=`` partition (has a manifest) on or before the run date."""
     base = f"{settings.bronze_prefix}postgres/{table}/"
     cutoff = f"{base}ingest_date={settings.run_date.isoformat()}/"
-    partitions = [p for p in lake.list_partitions(base) if p <= cutoff]
+    partitions = [p for p in lake.list_partitions(base) if p <= cutoff and lake.exists(p + "_manifest.json")]
     if not partitions:
-        raise FileNotFoundError(f"No Bronze snapshot for {table} at {lake.uri(base)}")
+        raise FileNotFoundError(f"No committed Bronze snapshot for {table} at {lake.uri(base)}")
     return partitions[-1]
 
 
@@ -175,8 +192,10 @@ def build_silver(settings: Settings, lake: Lake, ctx: RunContext) -> None:
 
     with ctx.step("silver", "learning_activity") as rec:
         prefix = f"{settings.bronze_prefix}lms/learning_activity/"
-        bronze_df = lake.read_parquet(prefix).rename(columns={"_run_id": "_bronze_run_id"})
+        all_loads = lake.read_parquet(prefix).rename(columns={"_run_id": "_bronze_run_id"})
+        bronze_df, superseded = latest_file_loads(all_loads)
         rec.inputs = [lake.uri(prefix)]
+        rec.details["superseded_bronze_rows"] = superseded
         parsed, malformed = parse_event_lines(bronze_df)
         result = validate(parsed, CONTRACTS["learning_activity"], reference_keys)
         valid = conform_events(result.valid).drop(columns=["raw_line"], errors="ignore")

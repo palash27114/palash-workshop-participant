@@ -86,9 +86,29 @@ class Lake:
         return len(keys)
 
     # ------------------------------------------------------------------ bytes/json
-    def put_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
-        """Upload raw bytes to ``key``."""
+    def put_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
+        """Upload raw bytes to ``key`` and return its ``s3://`` URI."""
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
+        return self.uri(key)
+
+    def copy_object(self, source_key: str, target_key: str) -> str:
+        """Server-side copy inside the bucket; the bytes never leave S3, so the copy is exact."""
+        self.s3.copy_object(Bucket=self.bucket, Key=target_key, CopySource={"Bucket": self.bucket, "Key": source_key})
+        return self.uri(target_key)
+
+    def head(self, key: str) -> dict:
+        """Object metadata (ContentLength, ETag, ...)."""
+        return self.s3.head_object(Bucket=self.bucket, Key=key)
+
+    def exists(self, key: str) -> bool:
+        """True if ``key`` exists."""
+        try:
+            self.head(key)
+            return True
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
 
     def get_bytes(self, key: str) -> bytes:
         """Download ``key`` as bytes."""
