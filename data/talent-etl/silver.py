@@ -1,13 +1,21 @@
 """
 Silver layer: parsed, typed, validated and conformed entities.
 
-For every dataset Silver reads Bronze, applies the dataset's contract
-(:mod:`contracts`), writes the valid rows to ``silver/<entity>/`` and the
-rejected rows (with ``_dq_reason``) to ``quarantine/<entity>/run_date=<d>/``.
+For every dataset Silver:
 
-Invariant checked on every run (reconciliation)::
+1. reads Bronze (the latest committed PostgreSQL snapshot; the latest load of
+   each learning-activity file),
+2. applies the dataset's contract (:mod:`contracts`): known renamed columns
+   are mapped back, values are typed, rules are checked, and failing rows go to
+   ``quarantine/<entity>/run_date=<d>/`` with a ``_dq_reason``,
+3. conforms the valid rows (derived columns, standard column order),
+4. checks the result before publishing (primary key present and unique,
+   required fields filled, types exactly as contracted) and reconciles counts::
 
-    bronze rows == silver rows + quarantined rows
+       bronze rows == silver rows + quarantined rows
+
+5. writes ``silver/<entity>/`` and a per-run data-quality report at
+   ``quarantine/_reports/run_date=<d>/dq_report.json``.
 
 Silver is a full, deterministic rebuild from Bronze, so re-running it never
 duplicates data.
@@ -17,11 +25,12 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 
 import pandas as pd
 
 from config import Settings
-from contracts import CONTRACTS, validate
+from contracts import CONTRACTS, Contract, matches_type, order_columns, validate
 from lineage import RunContext
 from storage import Lake
 
@@ -37,13 +46,35 @@ ENTITY_ORDER = (
     "competency_assessments",
     "talent_review",
 )
+SAMPLES_PER_REASON = 3
 
 
 class ReconciliationError(Exception):
     """Raised when rows go missing between Bronze and Silver."""
 
 
+class SilverCheckError(Exception):
+    """Raised when validated Silver output breaks a structural guarantee."""
+
+
 # --------------------------------------------------------------------------- pure transforms
+def latest_file_loads(bronze: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Keep only the most recent Bronze load of each landing file.
+
+    Bronze is write-once, so a file that changed upstream (or was re-loaded
+    with ``--force-bronze``) has several loads side by side. Each load has one
+    ``_ingested_at`` per file; Silver must read exactly one load per file.
+
+    Returns:
+        (rows of the latest load per file, number of superseded rows excluded)
+    """
+    loads = bronze[["_source_key", "_ingested_at"]].drop_duplicates()
+    latest = loads.sort_values("_ingested_at").drop_duplicates("_source_key", keep="last")
+    current = bronze.merge(latest, on=["_source_key", "_ingested_at"], how="inner")
+    return current, len(bronze) - len(current)
+
+
 def parse_event_lines(bronze: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Parse raw JSONL lines.
@@ -71,29 +102,15 @@ def parse_event_lines(bronze: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     # Every value arrives as text into the contract; it does the typing. JSON null and
     # keys absent from a record (NaN after from_records) must stay null, not become "nan".
     parsed = parsed.apply(lambda s: s.map(lambda v: None if v is None or v is pd.NA or v != v else str(v)))
-    parsed = pd.concat([parsed, bronze.loc[good_idx, meta_cols]], axis=1).reset_index(drop=True)
+    parsed = pd.concat([parsed, bronze.loc[good_idx, meta_cols]], axis=1)
+    # The original line travels with the row so a quarantined record shows exactly what arrived.
+    parsed["_raw_line"] = bronze.loc[good_idx, "raw_line"]
+    parsed = parsed.reset_index(drop=True)
 
-    malformed = bronze.loc[bad_idx].copy()
+    malformed = bronze.loc[bad_idx].rename(columns={"raw_line": "_raw_line"})
     malformed["_dq_reason"] = "malformed_json"
     malformed = malformed.astype("string").reset_index(drop=True)
     return parsed, malformed
-
-
-def latest_file_loads(bronze: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """
-    Keep only the most recent Bronze load of each landing file.
-
-    Bronze is write-once, so a file that changed upstream (or was re-loaded
-    with ``--force-bronze``) has several loads side by side. Each load has one
-    ``_ingested_at`` per file; Silver must read exactly one load per file.
-
-    Returns:
-        (rows of the latest load per file, number of superseded rows excluded)
-    """
-    loads = bronze[["_source_key", "_ingested_at"]].drop_duplicates()
-    latest = loads.sort_values("_ingested_at").drop_duplicates("_source_key", keep="last")
-    current = bronze.merge(latest, on=["_source_key", "_ingested_at"], how="inner")
-    return current, len(bronze) - len(current)
 
 
 def conform_employees(df: pd.DataFrame) -> pd.DataFrame:
@@ -133,6 +150,39 @@ CONFORMERS = {
 }
 
 
+def silver_checks(valid: pd.DataFrame, contract: Contract) -> dict[str, bool]:
+    """Structural guarantees every published Silver dataset must meet."""
+    pk = list(contract.primary_key)
+    return {
+        "primary_key_not_null": not valid[pk].isna().any().any(),
+        "primary_key_unique": not valid.duplicated(pk).any(),
+        "required_fields_not_null": not valid[list(contract.required)].isna().any().any(),
+        "types_match_contract": all(matches_type(valid[c], kind) for c, kind in contract.columns.items()),
+        "renamed_columns_folded_in": not any(c in valid.columns for c in contract.aliases),
+    }
+
+
+def quarantine_samples(quarantined: pd.DataFrame, limit: int = SAMPLES_PER_REASON) -> dict[str, list[dict]]:
+    """A few example rows per primary rejection reason, for the human-readable DQ report."""
+    if quarantined.empty:
+        return {}
+    first_reason = quarantined["_dq_reason"].str.split(";").str[0]
+    keep = [c for c in quarantined.columns
+            if c in ("_raw_line", "_source_key", "_line_number", "_dq_reason") or not c.startswith("_")]
+    samples = {}
+    for reason, rows in quarantined.assign(_rule=first_reason).groupby("_rule", sort=True):
+        head = rows[keep].head(limit).astype(object)
+        samples[reason] = head.where(head.notna(), None).to_dict(orient="records")
+    return samples
+
+
+def conform(name: str, valid: pd.DataFrame) -> pd.DataFrame:
+    """Apply the dataset's conformer and the standard column order."""
+    # The raw line is kept for quarantined rows only; valid Silver rows don't need it.
+    out = CONFORMERS.get(name, lambda d: d)(valid).drop(columns=["_raw_line"], errors="ignore")
+    return order_columns(out, CONTRACTS[name])
+
+
 # --------------------------------------------------------------------------- IO orchestration
 def _latest_bronze_partition(lake: Lake, settings: Settings, table: str) -> str:
     """Most recent *committed* ``ingest_date=`` partition (has a manifest) on or before the run date."""
@@ -149,36 +199,41 @@ def _publish(
     settings: Settings,
     ctx: RunContext,
     name: str,
-    bronze_df: pd.DataFrame,
+    bronze_rows: int,
     valid: pd.DataFrame,
     quarantined: pd.DataFrame,
     stats: dict,
     rec,
     partition_col: str | None = None,
-) -> None:
-    """Reconcile counts, then write Silver + quarantine and fill the lineage record."""
-    if len(bronze_df) != len(valid) + len(quarantined):
+) -> dict:
+    """Reconcile and check, then write Silver + quarantine; returns this dataset's DQ report entry."""
+    if bronze_rows != len(valid) + len(quarantined):
         raise ReconciliationError(
-            f"{name}: bronze={len(bronze_df)} != silver={len(valid)} + quarantine={len(quarantined)}"
-        )
-    valid = valid.copy()
-    valid["_silver_run_id"] = ctx.run_id
+            f"{name}: bronze={bronze_rows} != silver={len(valid)} + quarantine={len(quarantined)}")
+    checks = silver_checks(valid, CONTRACTS[name])
+    failed = [k for k, ok in checks.items() if not ok]
+    if failed:
+        raise SilverCheckError(f"{name}: failed Silver checks {failed}")
+
+    valid = valid.assign(_silver_run_id=ctx.run_id)
     rec.outputs = lake.replace_dataset(f"{settings.silver_prefix}{name}/", valid, partition_col)
     q_prefix = f"{settings.quarantine_prefix}{name}/run_date={settings.run_date.isoformat()}/"
     lake.delete_prefix(q_prefix)
     if not quarantined.empty:
         rec.outputs.append(lake.write_parquet(f"{q_prefix}part-000.parquet", quarantined))
-    rec.rows_read = len(bronze_df)
+    rec.rows_read = bronze_rows
     rec.rows_written = len(valid)
     rec.rows_quarantined = len(quarantined)
-    rec.details["dq"] = stats
+    rec.details.update(dq=stats, checks=checks)
     if valid.empty:
         log.warning("silver %s: zero valid rows written", name)
+    return {**stats, "checks": checks, "quarantine_samples": quarantine_samples(quarantined)}
 
 
 def build_silver(settings: Settings, lake: Lake, ctx: RunContext) -> None:
-    """Validate every entity from Bronze into Silver."""
+    """Validate every entity from Bronze into Silver and publish the run's DQ report."""
     reference_keys: dict[str, set] = {}
+    report: dict[str, dict] = {}
 
     for name in ENTITY_ORDER:
         with ctx.step("silver", name) as rec:
@@ -186,9 +241,10 @@ def build_silver(settings: Settings, lake: Lake, ctx: RunContext) -> None:
             bronze_df = lake.read_parquet(partition).rename(columns={"_run_id": "_bronze_run_id"})
             rec.inputs = [lake.uri(partition)]
             result = validate(bronze_df, CONTRACTS[name], reference_keys)
-            valid = CONFORMERS.get(name, lambda d: d)(result.valid)
+            valid = conform(name, result.valid)
             reference_keys[name] = set(valid[CONTRACTS[name].primary_key[0]].dropna())
-            _publish(lake, settings, ctx, name, bronze_df, valid, result.quarantined, result.stats, rec)
+            report[name] = _publish(lake, settings, ctx, name, len(bronze_df), valid,
+                                    result.quarantined, result.stats, rec)
 
     with ctx.step("silver", "learning_activity") as rec:
         prefix = f"{settings.bronze_prefix}lms/learning_activity/"
@@ -198,11 +254,20 @@ def build_silver(settings: Settings, lake: Lake, ctx: RunContext) -> None:
         rec.details["superseded_bronze_rows"] = superseded
         parsed, malformed = parse_event_lines(bronze_df)
         result = validate(parsed, CONTRACTS["learning_activity"], reference_keys)
-        valid = conform_events(result.valid).drop(columns=["raw_line"], errors="ignore")
+        valid = conform("learning_activity", result.valid)
         quarantined = pd.concat([malformed, result.quarantined], ignore_index=True)
         stats = dict(result.stats)
-        stats["rows_in"] = len(bronze_df)
-        stats["rows_quarantined"] = len(quarantined)
-        stats["quarantine_reasons"] = {**stats["quarantine_reasons"], "malformed_json": len(malformed)}
-        _publish(lake, settings, ctx, "learning_activity", bronze_df, valid, quarantined, stats, rec,
-                 partition_col="event_year")
+        stats.update(rows_in=len(bronze_df), rows_quarantined=len(quarantined), superseded_bronze_rows=superseded,
+                     quarantine_reasons={**stats["quarantine_reasons"], "malformed_json": len(malformed)})
+        report["learning_activity"] = _publish(lake, settings, ctx, "learning_activity", len(bronze_df), valid,
+                                               quarantined, stats, rec, partition_col="event_year")
+
+    report_key = f"{settings.quarantine_prefix}_reports/run_date={settings.run_date.isoformat()}/dq_report.json"
+    lake.put_json(report_key, {
+        "run_id": ctx.run_id,
+        "run_date": settings.run_date.isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {n: {k: r[k] for k in ("rows_in", "rows_valid", "rows_quarantined")} for n, r in report.items()},
+        "datasets": report,
+    })
+    log.info("silver dq_report=%s", lake.uri(report_key))

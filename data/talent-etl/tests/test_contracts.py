@@ -66,6 +66,34 @@ def test_missing_contract_column_raises_schema_error():
         validate(df, CONTRACTS["performance_reviews"])
 
 
+def _event(**overrides):
+    row = {"event_id": "E1", "employee_id": "1", "event_date": "2026-01-02T10:00:00",
+           "event_type": "enrollment", "course_name": "Py", "text": None, "score": None}
+    row.update(overrides)
+    return row
+
+
+def test_renamed_column_is_recovered_into_contract_column():
+    df = pd.DataFrame([_event(notes="Enrolled in Py.")]).drop(columns=["text"])
+    result = validate(df, CONTRACTS["learning_activity"], {"employees": {1}})
+    assert result.valid["text"].iloc[0] == "Enrolled in Py."
+    assert "notes" not in result.valid.columns
+    assert result.stats["recovered_from_aliases"] == {"notes->text": 1}
+    assert result.stats["dropped_columns"] == []
+
+
+def test_alias_only_fills_blanks_and_counts_conflicts():
+    df = pd.DataFrame([
+        _event(event_id="E1", text=None, notes="from notes"),
+        _event(event_id="E2", text="original", notes="ignored"),
+        _event(event_id="E3", text="kept", notes=None),
+    ])
+    result = validate(df, CONTRACTS["learning_activity"], {"employees": {1}})
+    assert result.valid.set_index("event_id")["text"].to_dict() == {
+        "E1": "from notes", "E2": "original", "E3": "kept"}
+    assert result.stats["recovered_from_aliases"] == {"notes->text": 1, "notes->text:conflicts": 1}
+
+
 def test_unexpected_column_is_dropped_and_reported():
     result = validate(pd.DataFrame([_reviews(surprise="x")]), CONTRACTS["performance_reviews"], {"employees": {1}})
     assert "surprise" not in result.valid.columns

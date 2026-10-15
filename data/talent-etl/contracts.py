@@ -42,6 +42,8 @@ class Contract:
     ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     foreign_keys: dict[str, str] = field(default_factory=dict)  # column -> referenced entity
     date_formats: dict[str, str] = field(default_factory=dict)
+    # Known schema drift: source column name -> contract column it was renamed from.
+    aliases: dict[str, str] = field(default_factory=dict)
 
 
 CONTRACTS: dict[str, Contract] = {
@@ -175,6 +177,8 @@ CONTRACTS: dict[str, Contract] = {
             ranges={"score": (0, 100)},
             foreign_keys={"employee_id": "employees"},
             date_formats={"event_date": "ISO8601"},
+            # 39 events in the sample carry their description under "notes" instead of "text".
+            aliases={"notes": "text"},
         ),
     ]
 }
@@ -187,6 +191,60 @@ class ValidationResult:
     valid: pd.DataFrame
     quarantined: pd.DataFrame
     stats: dict[str, object]
+
+
+def _present(series: pd.Series) -> pd.Series:
+    """True where a raw value is neither null nor blank."""
+    return series.notna() & (series.astype("string").str.strip() != "")
+
+
+def apply_aliases(df: pd.DataFrame, contract: Contract) -> tuple[pd.DataFrame, dict[str, int]]:
+    """
+    Map known renamed source columns back to their contract name.
+
+    The alias value fills the contract column only where the contract column
+    is null or blank; if both are present the contract column wins (and the
+    conflict is counted). The alias column is then dropped.
+
+    Returns:
+        (frame, {"<alias>-><column>": rows recovered, "<alias>-><column>:conflicts": n})
+    """
+    out = df.copy()
+    stats: dict[str, int] = {}
+    for alias, column in contract.aliases.items():
+        if alias not in out.columns:
+            continue
+        has_alias = _present(out[alias])
+        if column in out.columns:
+            target_blank = ~_present(out[column])
+            fill = has_alias & target_blank
+            out[column] = out[column].astype(object).where(~fill, out[alias])
+            conflicts = int((has_alias & ~target_blank).sum())
+            if conflicts:
+                stats[f"{alias}->{column}:conflicts"] = conflicts
+        else:
+            fill = has_alias
+            out[column] = out[alias]
+        stats[f"{alias}->{column}"] = int(fill.sum())
+        out = out.drop(columns=[alias])
+        log.info("%s: recovered %d value(s) from renamed column '%s' into '%s'",
+                 contract.name, int(fill.sum()), alias, column)
+    return out, stats
+
+
+def matches_type(series: pd.Series, kind: str) -> bool:
+    """True if a Silver column has the dtype its contract type promises."""
+    if kind in ("date", "datetime"):
+        return pd.api.types.is_datetime64_any_dtype(series)
+    return str(series.dtype) == _DTYPES[kind]
+
+
+def order_columns(df: pd.DataFrame, contract: Contract) -> pd.DataFrame:
+    """Standard Silver layout: contract columns, then derived columns, then ``_`` audit columns."""
+    contract_cols = [c for c in contract.columns if c in df.columns]
+    derived = [c for c in df.columns if c not in contract.columns and not c.startswith("_")]
+    audit = [c for c in df.columns if c.startswith("_")]
+    return df[contract_cols + derived + audit]
 
 
 def _cast(series: pd.Series, kind: str, fmt: str | None) -> pd.Series:
@@ -225,6 +283,7 @@ def validate(
         SchemaError: when a contract column is missing from the input entirely.
     """
     reference_keys = reference_keys or {}
+    df, alias_stats = apply_aliases(df, contract)
     missing_cols = [c for c in contract.columns if c not in df.columns]
     if missing_cols:
         raise SchemaError(f"{contract.name}: missing required column(s) {missing_cols}")
@@ -285,6 +344,7 @@ def validate(
         "rows_quarantined": int(len(quarantined)),
         "quarantine_reasons": dict(sorted(by_reason.items())),
         "dropped_columns": extra_cols,
+        "recovered_from_aliases": alias_stats,
     }
     log.info(
         "dq dataset=%s rows_in=%d valid=%d quarantined=%d reasons=%s",

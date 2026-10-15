@@ -71,6 +71,14 @@ def test_pipeline_end_to_end_reconciles_and_is_idempotent(scratch_lake):
     assert events["rows_read"] == events["rows_written"] + events["rows_quarantined"]
     assert events["rows_quarantined"] > 0  # the sample dataset contains planted bad records
 
+    # Silver: renamed "notes" values recovered, all structural checks passed, DQ report published.
+    assert events["details"]["dq"]["recovered_from_aliases"] == {"notes->text": 39}
+    assert events["details"]["dq"]["dropped_columns"] == []
+    assert all(events["details"]["checks"].values())
+    report = scratch_lake.get_json("quarantine/_reports/run_date=2026-10-15/dq_report.json")
+    assert report["summary"]["learning_activity"]["rows_quarantined"] == events["rows_quarantined"]
+    assert set(report["datasets"]["learning_activity"]["quarantine_samples"]) >= {"malformed_json", "duplicate_pk"}
+
     # Silver -> Gold: employee-grain tables have one row per employee.
     employees = first[("silver", "employees")]["rows_written"]
     assert first[("gold", "employee_performance_summary")]["rows_written"] == employees
