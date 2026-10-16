@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from contracts import CONTRACTS, validate
-from silver import conform, conform_events, conform_reviews, parse_event_lines, quarantine_samples, silver_checks
+from silver import quarantine_alert, conform, conform_events, conform_reviews, parse_event_lines, quarantine_samples, silver_checks
 
 
 def _bronze(lines):
@@ -99,3 +99,16 @@ def test_quarantine_samples_groups_by_first_reason():
     assert set(samples) == {"missing:employee_id", "duplicate_pk"}  # grouped by rule + column
     assert len(samples["missing:employee_id"]) == 1
     assert "_bronze_run_id" not in samples["missing:employee_id"][0]
+
+
+@pytest.mark.parametrize("quarantined,level", [(0, "ok"), (49, "ok"), (50, "warning"), (499, "warning"), (500, "critical"),
+                                               (1000, "critical")])
+def test_quarantine_alert_levels(quarantined, level):
+    """1,000 rows: warn from 5% (50 rows), stop publishing from 50% (500 rows)."""
+    alert = quarantine_alert(1000, quarantined, warn_pct=5, fail_pct=50)
+    assert alert["level"] == level
+    assert alert["rate_pct"] == quarantined / 10
+
+
+def test_quarantine_alert_empty_batch_is_ok():
+    assert quarantine_alert(0, 0, 5, 50)["level"] == "ok"

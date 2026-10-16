@@ -48,6 +48,7 @@ class RunContext:
         self.run_date = run_date
         self.started_at = datetime.now(timezone.utc)
         self.steps: list[StepRecord] = []
+        self.alerts: list[dict[str, object]] = []
         self.status = "running"
         self._lake = lake
         self._prefix = lineage_prefix
@@ -91,6 +92,7 @@ class RunContext:
                 }
                 for layer in dict.fromkeys(s.layer for s in self.steps)
             },
+            "alerts": self.alerts,
             "steps": [asdict(s) for s in self.steps],
         }
 

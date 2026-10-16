@@ -129,6 +129,12 @@ st.title("ACME Talent Lake")
 st.caption(f"Performance, skills, development and attrition from the Gold layer · showing **{scope}** "
            f"({k['employees']:,} employees)")
 
+alerts = (gold.dq_report or {}).get("alerts", [])
+for al in alerts:
+    msg = (f"Data-quality alert ({al['level']}): {al['rate_pct']}% of {al['dataset']} rows were quarantined in the "
+           f"last run (warn at {al['warn_pct']}%, stop at {al['fail_pct']}%). See the Data quality tab.")
+    (st.error if al["level"] == "critical" else st.warning)(msg)
+
 if k["employees"] == 0:
     st.warning("No employees match these filters. Clear a filter in the sidebar.")
     st.stop()
@@ -360,6 +366,16 @@ with tabs[6]:
     if gold.dq_report:
         la = gold.dq_report["datasets"]["learning_activity"]
         st.subheader(f"Learning events: {la['rows_quarantined']:,} of {la['rows_in']:,} quarantined")
+        th = gold.dq_report.get("thresholds", {})
+        if th:
+            st.caption(f"Alert thresholds: warning at {th['warn_pct']}% quarantined, critical at {th['fail_pct']}% "
+                       "(critical keeps the previous Silver data and stops the run).")
+            rates = pd.DataFrame([{"dataset": n, "rows in": v["rows_in"], "quarantined": v["rows_quarantined"],
+                                   "rate %": v.get("rate_pct"), "status": v.get("level", "ok")}
+                                  for n, v in gold.dq_report["summary"].items()])
+            st.dataframe(rates, hide_index=True, width="stretch")
+            if not gold.dq_report.get("alerts"):
+                st.success("All datasets are below the warning threshold.")
         reasons = (pd.Series(la["quarantine_reasons"]).rename_axis("reason").reset_index(name="rows"))
         reasons["reason"] = reasons["reason"].str.replace("_", " ")
         chart(hbar(reasons, "reason", "rows", "quarantined rows"))

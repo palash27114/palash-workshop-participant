@@ -57,6 +57,24 @@ class SilverCheckError(Exception):
     """Raised when validated Silver output breaks a structural guarantee."""
 
 
+class QuarantineThresholdError(Exception):
+    """Raised when a dataset's quarantine rate reaches the critical threshold."""
+
+
+def quarantine_alert(rows_in: int, quarantined: int, warn_pct: float, fail_pct: float) -> dict[str, object]:
+    """
+    Classify a batch by the share of rows quarantined.
+
+    ``ok`` below ``warn_pct``; ``warning`` from ``warn_pct`` (publish, but flag it); ``critical`` from
+    ``fail_pct`` (e.g. 500 of 1,000 rows): the source is probably broken, so the batch must not replace
+    the last good Silver data.
+    """
+    rate = 100.0 * quarantined / rows_in if rows_in else 0.0
+    level = "critical" if rate >= fail_pct else "warning" if rate >= warn_pct else "ok"
+    return {"level": level, "rate_pct": round(rate, 2), "rows_in": rows_in, "rows_quarantined": quarantined,
+            "warn_pct": warn_pct, "fail_pct": fail_pct}
+
+
 # --------------------------------------------------------------------------- pure transforms
 def latest_file_loads(bronze: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """
@@ -214,20 +232,35 @@ def _publish(
     failed = [k for k, ok in checks.items() if not ok]
     if failed:
         raise SilverCheckError(f"{name}: failed Silver checks {failed}")
+    alert = quarantine_alert(bronze_rows, len(quarantined), settings.quarantine_warn_pct, settings.quarantine_fail_pct)
 
-    valid = valid.assign(_silver_run_id=ctx.run_id)
-    rec.outputs = lake.replace_dataset(f"{settings.silver_prefix}{name}/", valid, partition_col)
+    # Quarantine is always written: it is the evidence, whatever the alert level.
     q_prefix = f"{settings.quarantine_prefix}{name}/run_date={settings.run_date.isoformat()}/"
     lake.delete_prefix(q_prefix)
+    rec.outputs = []
     if not quarantined.empty:
         rec.outputs.append(lake.write_parquet(f"{q_prefix}part-000.parquet", quarantined))
     rec.rows_read = bronze_rows
-    rec.rows_written = len(valid)
     rec.rows_quarantined = len(quarantined)
-    rec.details.update(dq=stats, checks=checks)
-    if valid.empty:
-        log.warning("silver %s: zero valid rows written", name)
-    return {**stats, "checks": checks, "quarantine_samples": quarantine_samples(quarantined)}
+    rec.details.update(dq=stats, checks=checks, alert=alert)
+
+    if alert["level"] == "critical":
+        # Keep the last good Silver data rather than publish a batch that is mostly rejects.
+        log.error("ALERT critical dataset=%s quarantined=%s%% (>= %s%%): Silver not updated, previous data kept",
+                  name, alert["rate_pct"], alert["fail_pct"])
+        rec.details["published"] = False
+    else:
+        if alert["level"] == "warning":
+            log.warning("ALERT warning dataset=%s quarantined=%s%% (>= %s%%)", name, alert["rate_pct"], alert["warn_pct"])
+        valid = valid.assign(_silver_run_id=ctx.run_id)
+        rec.outputs = lake.replace_dataset(f"{settings.silver_prefix}{name}/", valid, partition_col) + rec.outputs
+        rec.rows_written = len(valid)
+        rec.details["published"] = True
+        if valid.empty:
+            log.warning("silver %s: zero valid rows written", name)
+    if alert["level"] != "ok":
+        ctx.alerts.append({"dataset": name, **alert})
+    return {**stats, "checks": checks, "alert": alert, "quarantine_samples": quarantine_samples(quarantined)}
 
 
 def build_silver(settings: Settings, lake: Lake, ctx: RunContext) -> None:
@@ -267,7 +300,15 @@ def build_silver(settings: Settings, lake: Lake, ctx: RunContext) -> None:
         "run_id": ctx.run_id,
         "run_date": settings.run_date.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "summary": {n: {k: r[k] for k in ("rows_in", "rows_valid", "rows_quarantined")} for n, r in report.items()},
+        "thresholds": {"warn_pct": settings.quarantine_warn_pct, "fail_pct": settings.quarantine_fail_pct},
+        "alerts": [a for a in ctx.alerts],
+        "summary": {n: {**{k: r[k] for k in ("rows_in", "rows_valid", "rows_quarantined")},
+                        "rate_pct": r["alert"]["rate_pct"], "level": r["alert"]["level"]} for n, r in report.items()},
         "datasets": report,
     })
     log.info("silver dq_report=%s", lake.uri(report_key))
+    critical = [a["dataset"] for a in ctx.alerts if a["level"] == "critical"]
+    if critical:
+        raise QuarantineThresholdError(
+            f"quarantine rate reached {settings.quarantine_fail_pct}% for {critical}: run stopped, previous "
+            f"Silver/Gold kept. See {lake.uri(report_key)}")

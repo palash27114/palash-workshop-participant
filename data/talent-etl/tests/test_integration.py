@@ -142,3 +142,22 @@ def test_force_bronze_reloads_without_duplicating(scratch_lake):
     assert steps[EVENTS_STEP]["details"]["loaded_files"] == 783
     assert "skipped" not in steps[("bronze", "postgres/employees")]["details"]
     assert steps[("silver", "learning_activity")]["rows_written"] == silver_rows
+
+
+def test_critical_quarantine_rate_keeps_previous_silver_and_stops(scratch_lake, monkeypatch):
+    """A batch whose quarantine rate reaches the critical threshold must not replace good Silver data."""
+    assert job.main([]) == 0
+    before = scratch_lake.read_parquet("silver/learning_activity/")
+
+    # The real batch quarantines ~1% of events; lower the critical threshold so it counts as broken.
+    monkeypatch.setenv("QUARANTINE_FAIL_PCT", "0.5")
+    assert job.main(["--layers", "silver"]) == 1
+
+    manifest = scratch_lake.get_json("_lineage/latest.json")
+    assert manifest["status"] == "failed"
+    assert [a["dataset"] for a in manifest["alerts"] if a["level"] == "critical"] == ["learning_activity"]
+    report = scratch_lake.get_json("quarantine/_reports/run_date=2026-10-15/dq_report.json")
+    assert report["summary"]["learning_activity"]["level"] == "critical"
+    after = scratch_lake.read_parquet("silver/learning_activity/")
+    assert len(after) == len(before)  # previous good Silver kept
+    assert set(after["_silver_run_id"]) == set(before["_silver_run_id"])

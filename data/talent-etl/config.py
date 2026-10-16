@@ -46,6 +46,10 @@ class Settings:
         )
     )
 
+    # Quarantine alert thresholds (% of a dataset's rows): warn, and stop publishing that dataset.
+    quarantine_warn_pct: float = 5.0
+    quarantine_fail_pct: float = 50.0
+
     # Prefixes inside the lake bucket. Kept here so every layer agrees on layout.
     landing_prefix: str = "landing/learning_activity/"
     bronze_prefix: str = "bronze/"
@@ -107,4 +111,6 @@ def load_settings() -> Settings:
         postgres_user=_env("POSTGRES_USER", "postgres"),
         postgres_pass=_env("POSTGRES_PASS", "postgres123" if is_local else ""),
         source_schema=_env("SOURCE_DB_SCHEMA", "hr"),
+        quarantine_warn_pct=float(_env("QUARANTINE_WARN_PCT", "5")),
+        quarantine_fail_pct=float(_env("QUARANTINE_FAIL_PCT", "50")),
     )
